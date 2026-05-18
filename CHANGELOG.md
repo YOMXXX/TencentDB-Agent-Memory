@@ -18,6 +18,11 @@
 - **新增 `tdai-memory-gateway` bin**（`./dist/src/gateway/cli.mjs`）：作为独立可执行 Gateway entry point，支持 `SIGTERM/SIGINT` 优雅关闭、可选父进程 PID liveness 探活（`TDAI_CC_PID` 环境变量，轮询间隔 15s）。供 Claude Code / Codex CLI 插件通过 `npx tdai-memory-gateway` 调用，无需把 npm 依赖打包进插件。
 - **daemon 进程管理重写**：基于 `O_CREAT|O_EXCL` 的 `spawn.lock` 互斥，并发触发的 SessionStart / UserPromptSubmit / Stop hook 中只有一个会真正 spawn，其余复用结果，根本性解决双 daemon / 端口与 token 错配问题；`state.json` 改 tmp + rename 原子写；`ensureRunning` 复用旧 daemon 前校验 `state.ccPid` 与当前 cc 一致，避免跨用户/跨会话错用旧 daemon；spawn 时显式设置 `cwd` 与 `TDAI_DATA_DIR` 注入，避免数据目录受 hook 进程 cwd 漂移影响；token 文件权限校验在 Windows 上跳过 `0o077` 位检测（Node `fs` 在 Win 下返回固定 mode 会误报），改用 NTFS ACL。
 - **`$ARGUMENTS` 命令注入面收敛**：cc 当前对 SKILL.md ``!`...` `` 块内的 `$ARGUMENTS` 执行字面 `replaceAll`，用户输入 `foo"; curl evil; "` 可注入到 shell（详见 anthropics/claude-code#16163）。重写 `memory-search/SKILL.md` 去掉 ``!`...` `` bash 块，改为引导 Claude 以 heredoc 通过 Bash 工具向 `hook.mjs search-stdin` 的 stdin 喂查询，用户输入不再经过 shell 词法解析。
+- **Gateway 加固 CORS / Host / startup 三层安全门**：
+  - **CORS 改为 opt-in**：之前 `handleRequest` 无条件下发 `Access-Control-Allow-Origin: *` + 允许 `Authorization` 头，与 README 描述（默认禁用 CORS）矛盾。现仅在 `TDAI_GATEWAY_CORS_ORIGIN` 显式设置时下发对应 Origin 的 CORS 头并对 OPTIONS preflight 返回 204；默认状态下 OPTIONS 与其他请求一样被 Bearer auth 拦截，不再绕过。
+  - **Host header 白名单**：`handleRequest` 在路由前校验 `req.headers.host`，剥离端口/IPv6 括号后必须在 `{127.0.0.1, localhost, ::1, ::ffff:127.0.0.1}` 集合内，否则 403。`TDAI_GATEWAY_ALLOW_REMOTE=1` 显式 opt-in 时跳过校验。**防御 DNS rebinding**：攻击者域名短 TTL 重定向到 `127.0.0.1` 后浏览器 JS 发出的 fetch 在 Host 校验阶段就被拦下，即使 Bearer auth 未启用也不暴露 daemon。
+  - **server.ts main() 入口与 cli.ts 共用一段安全门**：`assertSafeHost()` + `loadTokenFromFile()` 从 cli.ts 提到 server.ts 作为 export helper（`applyStartupSafety()`），两条入口（`tdai-memory-gateway` bin 与 `tsx src/gateway/server.ts` 直跑）调用同一段代码。原 server.ts main() 跳过 host/token 校验的潜在裸奔路径关闭。
+  - 测试矩阵：`auth.test.ts` 从 14 个 case 扩到 31 个，新增 CORS opt-in / Host 白名单 / `TDAI_GATEWAY_ALLOW_REMOTE` 跳过 的回归。
 
 ### 🐛 修复
 

@@ -16,6 +16,7 @@
 
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { URL } from "node:url";
 import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
@@ -46,6 +47,75 @@ import type { SeedProgress } from "../core/seed/types.js";
 
 const TAG = "[tdai-gateway]";
 const VERSION = "0.1.0";
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"]);
+
+function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false;
+  let host = hostHeader.trim().toLowerCase();
+  if (host.startsWith("[")) {
+    const closeBracket = host.indexOf("]");
+    if (closeBracket === -1) return false;
+    host = host.slice(1, closeBracket);
+  } else {
+    const colonIdx = host.indexOf(":");
+    if (colonIdx !== -1) host = host.slice(0, colonIdx);
+  }
+  return LOOPBACK_HOSTS.has(host);
+}
+
+/**
+ * Refuse to bind a non-loopback `TDAI_GATEWAY_HOST` unless
+ * `TDAI_GATEWAY_ALLOW_REMOTE=1` is explicitly set. Exits with code 2 on
+ * violation. Exported so cli.ts and this file's main() share the same gate.
+ */
+export function assertSafeHost(): void {
+  const host = process.env.TDAI_GATEWAY_HOST?.trim();
+  if (!host) return;
+  if (LOOPBACK_HOSTS.has(host)) return;
+  if (process.env.TDAI_GATEWAY_ALLOW_REMOTE === "1") return;
+  process.stderr.write(
+    `tdai-gateway: refusing to bind TDAI_GATEWAY_HOST=${host} (non-loopback). ` +
+      `Set TDAI_GATEWAY_ALLOW_REMOTE=1 to opt in.\n`,
+  );
+  process.exit(2);
+}
+
+/**
+ * If `TDAI_TOKEN_PATH` is set, read the token file and populate
+ * `TDAI_GATEWAY_TOKEN` in-process. Mutating the in-process env after spawn
+ * does NOT update the execve() environment block, so the token stays out of
+ * `/proc/<pid>/environ` and `ps -E`. Exits with code 2 on read failure /
+ * empty file.
+ */
+export function loadTokenFromFile(): void {
+  const tokenPath = process.env.TDAI_TOKEN_PATH;
+  if (!tokenPath) return;
+  try {
+    const token = readFileSync(tokenPath, "utf-8").trim();
+    if (!token) {
+      process.stderr.write(`tdai-gateway: TDAI_TOKEN_PATH=${tokenPath} is empty\n`);
+      process.exit(2);
+    }
+    process.env.TDAI_GATEWAY_TOKEN = token;
+  } catch (err) {
+    process.stderr.write(
+      `tdai-gateway: failed to read TDAI_TOKEN_PATH=${tokenPath}: ${String(err)}\n`,
+    );
+    process.exit(2);
+  }
+}
+
+/**
+ * Apply both startup-time defence-in-depth checks. Called from both
+ * cli.ts main() (the `tdai-memory-gateway` bin) and this file's main()
+ * (auto-start when running `node src/gateway/server.ts` directly). Either
+ * entry must never bypass these gates.
+ */
+export function applyStartupSafety(): void {
+  assertSafeHost();
+  loadTokenFromFile();
+}
 
 // ============================
 // Console logger (for standalone gateway — no OpenClaw logger available)
@@ -170,19 +240,40 @@ export class TdaiGateway {
   // ============================
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Host header allowlist: defence against DNS rebinding. An attacker with
+    // a domain `evil.com` that has a short TTL can DNS-rebind a victim's
+    // browser to resolve `evil.com -> 127.0.0.1`, then issue fetch() to the
+    // local daemon. Without Host validation we'd accept that request; Bearer
+    // auth would still gate data exfiltration if enabled, but backward-compat
+    // (no-token) mode would be wide open. Require Host to be a loopback
+    // name/IP unless TDAI_GATEWAY_ALLOW_REMOTE=1 opted in at startup.
+    if (
+      process.env.TDAI_GATEWAY_ALLOW_REMOTE !== "1" &&
+      !isLoopbackHostHeader(req.headers.host)
+    ) {
+      sendError(res, 403, "Forbidden: Host header not in loopback allowlist");
+      return;
+    }
+
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method?.toUpperCase() ?? "GET";
     const pathname = url.pathname;
 
-    // CORS headers (for development)
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    // CORS is opt-in: only emit Access-Control-Allow-* headers (and ack
+    // OPTIONS preflight) when TDAI_GATEWAY_CORS_ORIGIN is explicitly set.
+    // The daemon binds loopback and gates with a Bearer token; cross-origin
+    // browser access has no legitimate use case by default.
+    const corsOrigin = process.env.TDAI_GATEWAY_CORS_ORIGIN?.trim();
+    if (corsOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-    if (method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
-      return;
+      if (method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
     }
 
     if (!this.authorize(req, res)) return;
@@ -474,8 +565,14 @@ export class TdaiGateway {
 /**
  * Start the gateway from the command line.
  * Usage: node --import tsx src/gateway/server.ts
+ *
+ * Auto-start path MUST apply the same startup safety (host allowlist + token
+ * file loading) as the `tdai-memory-gateway` bin. Skipping these would leave
+ * a direct `tsx server.ts` invocation running without enforcing the
+ * TDAI_GATEWAY_ALLOW_REMOTE / TDAI_TOKEN_PATH guarantees.
  */
 async function main(): Promise<void> {
+  applyStartupSafety();
   const gateway = new TdaiGateway();
 
   // Graceful shutdown
