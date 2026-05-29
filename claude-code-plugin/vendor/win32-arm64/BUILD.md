@@ -83,5 +83,5 @@ Then compare with `Get-FileHash` / `vec_version()` as shown above.
 and is dual-licensed **MIT OR Apache-2.0**. This redistributed binary is covered
 by that same upstream license; all copyright remains with the sqlite-vec authors.
 See the upstream [LICENSE](https://github.com/asg017/sqlite-vec/blob/main/LICENSE).
-This fork only compiled and repackaged the extension for the `win32-arm64`
+This build only compiled and repackaged the extension for the `win32-arm64`
 target that upstream does not yet provide.
