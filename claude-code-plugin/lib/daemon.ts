@@ -160,7 +160,14 @@ export class DaemonManager {
     const reuseExisting = async (): Promise<DaemonState | null> => {
       const existing = await readDaemonState(this.dataDir);
       if (!existing) return null;
-      if (existing.ccPid !== ccPid) return null;
+      // ccPid <= 0 marks a gateway whose lifecycle is owned externally — e.g.
+      // launched independently by start-gateway.ps1, not tied to any cc
+      // process and with no parent-watchdog. Reuse it for every session:
+      // memory is partitioned by cwd via session-key, not by cc pid, so a
+      // single shared gateway is correct. For session-bound daemons
+      // (ccPid > 0) keep the original same-session guard so the published
+      // cross-platform behaviour is unchanged.
+      if (existing.ccPid > 0 && existing.ccPid !== ccPid) return null;
       let token = "";
       try {
         token = await this.readToken(existing.tokenPath);
@@ -260,9 +267,15 @@ export class DaemonManager {
     const tokenPath = await this.generateToken();
     const token = await this.readToken(tokenPath);
 
-    const command = process.env.TDAI_GATEWAY_COMMAND ?? "npx";
-    const args = process.env.TDAI_GATEWAY_COMMAND
-      ? []
+    // TDAI_GATEWAY_COMMAND wires a local (unpublished) build directly, since
+    // npx cannot resolve a bin that isn't on the npm registry. Split on
+    // whitespace into command + args (e.g. "node /abs/path/to/cli.mjs"), per
+    // the README. Unset → fetch the published bin via npx.
+    const rawGatewayCommand = process.env.TDAI_GATEWAY_COMMAND?.trim();
+    const gatewayParts = rawGatewayCommand ? rawGatewayCommand.split(/\s+/) : [];
+    const command = rawGatewayCommand ? gatewayParts[0]! : "npx";
+    const args = rawGatewayCommand
+      ? gatewayParts.slice(1)
       : ["--yes", "tdai-memory-gateway"];
 
     // Pass the token by FILE PATH, not as an env var. execve() snapshots the
@@ -294,9 +307,15 @@ export class DaemonManager {
       // fall back to discarding stderr if we can't open the log
     }
 
+    // shell:true is REQUIRED on Windows: the default command is "npx", which
+    // on Windows is `npx.cmd` — Node's spawn cannot execute a .cmd directly
+    // (ENOENT) without going through cmd.exe. Without this the daemon never
+    // spawns on Windows. command/args are trusted (hardcoded or from the
+    // TDAI_GATEWAY_COMMAND env), so there is no shell-injection surface.
     const child: ChildProcess = spawn(command, args, {
       env: childEnv,
       cwd: this.dataDir,
+      shell: process.platform === "win32",
       detached: true,
       stdio: ["ignore", logFd, logFd],
     });

@@ -97,7 +97,8 @@
     "yaml": "^2.8.3"
   },
   "optionalDependencies": {
-    "opik": "^1.0.0"
+    "opik": "^1.0.0",
+    "sqlite-vec-windows-arm64": "file:claude-code-plugin/vendor/win32-arm64"
   },
   "peerDependencies": {
     "node-llama-cpp": "^3.16.2",
