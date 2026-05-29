@@ -12,12 +12,13 @@
 import { GatewayClient } from "./gateway-client.js";
 import { getSessionKey } from "./session-key.js";
 import { readAllTurns } from "./transcript.js";
-import { DaemonManager, readDaemonState } from "./daemon.js";
+import { DaemonManager, readDaemonState, clearDaemonState } from "./daemon.js";
 import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MAX_INJECT_CHARS = 10_000;
 const MAX_CAPTURE_TURNS = 50;
@@ -219,8 +220,95 @@ async function waitForTranscriptStable(path: string, maxMs: number): Promise<voi
   }
 }
 
+const PLUGIN_NAME = "tdai-memory";
+
+interface DataDirCandidate {
+  dir: string;
+  pid: number;
+  mtimeMs: number;
+}
+
+/**
+ * Resolve the gateway data directory.
+ *
+ * We cannot trust process.env.CLAUDE_PLUGIN_DATA here: Claude Code injects a
+ * single plugin's CLAUDE_PLUGIN_DATA into the generic Bash environment, and for
+ * slash-command / skill invocations (e.g. /memory-search) it routinely points
+ * at a DIFFERENT plugin's data dir. Hooks receive the correct per-plugin value,
+ * skills do not — so trusting the env var alone makes every manual search and
+ * status check resolve to the wrong dir and return empty.
+ *
+ * Instead we discover our own data dirs from this script's real on-disk
+ * location (env-independent) and pick the one whose daemon PID is actually
+ * alive — the gateway that is really running. Ties, and the case where no PID
+ * is alive, fall back to the most recently updated state.json.
+ */
 function resolveDataDir(): string {
-  return process.env.CLAUDE_PLUGIN_DATA ?? join(homedir(), ".tdai-memory");
+  const candidates = findOwnDataDirs();
+  if (candidates.length > 0) {
+    const alive = candidates.filter((c) => isPidAlive(c.pid));
+    const pool = alive.length > 0 ? alive : candidates;
+    pool.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return pool[0].dir;
+  }
+  // Nothing discoverable on disk: trust the env var only if it is ours,
+  // otherwise the home-dir fallback (never a foreign plugin's dir).
+  const env = process.env.CLAUDE_PLUGIN_DATA;
+  if (env && basename(env).startsWith(PLUGIN_NAME)) return env;
+  return join(homedir(), ".tdai-memory");
+}
+
+/**
+ * Discover this plugin's data dirs under <plugins>/data, located via the
+ * script's own path: <plugins>/<marketplace>/plugin/dist/lib/hook.mjs.
+ */
+function findOwnDataDirs(): DataDirCandidate[] {
+  const root = pluginsDataRoot();
+  if (!root) return [];
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return [];
+  }
+  const out: DataDirCandidate[] = [];
+  for (const name of names) {
+    if (!name.startsWith(PLUGIN_NAME)) continue;
+    const dir = join(root, name);
+    const statePath = join(dir, "state.json");
+    try {
+      const mtimeMs = statSync(statePath).mtimeMs;
+      const parsed = JSON.parse(readFileSync(statePath, "utf-8")) as { pid?: unknown };
+      const pid = typeof parsed.pid === "number" ? parsed.pid : 0;
+      out.push({ dir, pid, mtimeMs });
+    } catch {
+      // No readable state.json → not a usable candidate.
+    }
+  }
+  return out;
+}
+
+function pluginsDataRoot(): string | null {
+  try {
+    const self = fileURLToPath(import.meta.url);
+    // dist/lib/hook.mjs -> up 4 (lib, dist, plugin, <marketplace>) -> <plugins> -> data
+    const root = join(dirname(self), "..", "..", "..", "..", "data");
+    return existsSync(root) ? root : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True if a process with this PID currently exists (POSIX + Windows). */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM => the process exists but we lack permission to signal it.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function sanitizeCursorId(id: string): string {
@@ -440,11 +528,33 @@ async function main(): Promise<void> {
     const mgr = new DaemonManager({ dataDir });
     let state = await readDaemonState(dataDir);
 
-    if (event === "session-start" && !state) {
-      try {
-        state = await mgr.ensureRunning(process.ppid);
-      } catch (err) {
-        await safeLog(logPath, `session-start: spawn failed: ${(err as Error).message}`);
+    if (event === "session-start") {
+      // A stale state.json (dead pid / unreachable port) used to wedge the
+      // daemon forever: the old `!state` guard only spawned when state was
+      // ABSENT, so a leftover file meant ensureRunning never ran and every
+      // recall/capture hit ECONNREFUSED. Probe the recorded daemon; if it
+      // doesn't answer /health, drop the stale state and respawn fresh.
+      //
+      // Exception: an externally-managed gateway (ccPid <= 0, owned by
+      // start-gateway.ps1) is NEVER cleared or respawned when it's
+      // temporarily unreachable. Clearing it would let ensureRunning spawn a
+      // session-bound daemon that overwrites the operator's state.json and
+      // then self-exits when this cc session ends (the Windows failure mode
+      // this model was built to avoid). Leave it; the operator restarts it.
+      if (state && state.ccPid > 0 && !(await mgr.probe())) {
+        await safeLog(
+          logPath,
+          `session-start: stale daemon state (pid=${state.pid} port=${state.port}) unreachable — clearing and respawning`,
+        );
+        await clearDaemonState(dataDir);
+        state = null;
+      }
+      if (!state) {
+        try {
+          state = await mgr.ensureRunning(process.ppid);
+        } catch (err) {
+          await safeLog(logPath, `session-start: spawn failed: ${(err as Error).message}`);
+        }
       }
     }
 
@@ -489,7 +599,11 @@ async function safeLog(path: string, msg: string): Promise<void> {
   }
 }
 
-const isMainModule = import.meta.url === `file://${process.argv[1]}`;
+// Cross-platform main-module detection. The previous `file://${argv[1]}`
+// string never matched import.meta.url on Windows (drive-letter path with
+// backslashes vs a proper file:/// URL), so main() silently never ran.
+const isMainModule =
+  !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
   main().catch(() => process.exit(0));
 }

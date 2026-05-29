@@ -1,0 +1,7 @@
+{
+  "name": "sqlite-vec-windows-arm64",
+  "version": "0.1.7-alpha.2",
+  "description": "sqlite-vec loadable extension for windows-arm64 (locally compiled with zig 0.14.1; not an official upstream build)",
+  "license": "MIT OR Apache",
+  "files": ["vec0.dll"]
+}

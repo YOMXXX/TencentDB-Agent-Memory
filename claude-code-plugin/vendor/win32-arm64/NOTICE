@@ -1,0 +1,11 @@
+This directory redistributes a compiled build of sqlite-vec (vec0.dll).
+
+sqlite-vec
+  Copyright (c) Alex Garcia
+  https://github.com/asg017/sqlite-vec
+  Licensed under MIT OR Apache-2.0.
+
+The vec0.dll here was locally compiled for the win32-arm64 target (which
+upstream does not publish) and is distributed under the same MIT OR Apache-2.0
+license as the upstream project. All copyright remains with the sqlite-vec
+authors. Build provenance and reproduction steps: see BUILD.md.

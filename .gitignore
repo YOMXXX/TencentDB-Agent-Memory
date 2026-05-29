@@ -50,3 +50,7 @@ CLAUDE.md
 
 # Plugin build output
 claude-code-plugin/dist/
+
+# Windows launcher secrets (provider API keys) - NEVER commit, local only
+gateway.secrets.env
+*.secrets.env
